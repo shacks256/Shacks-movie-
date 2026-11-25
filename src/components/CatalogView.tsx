@@ -1,4 +1,6 @@
 import {
+  ChevronLeft,
+  ChevronRight,
   Clock,
   Download,
   ExternalLink,
@@ -14,9 +16,8 @@ import {
   TriangleAlert,
   X,
 } from 'lucide-react';
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import type { MediaItem } from '../types';
-import { FALLBACK_POSTER } from '../utils/media';
 
 interface CatalogViewProps {
   movies: MediaItem[];
@@ -60,7 +61,16 @@ export function CatalogView({
   const [selectedCategory, setSelectedCategory] = useState('All');
   const [selectedVj, setSelectedVj] = useState('All');
 
-  const sourceList = searchResults === null ? movies : searchResults;
+  const sourceList = useMemo(() => {
+    if (searchResults !== null) return searchResults;
+    return movies.filter(
+      (item) =>
+        item.id !== 67861 &&
+        !/rachael\s*magoola|rachel\s*magoola|just say it:\s*rachael/i.test(
+          `${item.title || ''} ${item.description || ''}`
+        )
+    );
+  }, [movies, searchResults]);
 
   const categories = useMemo(() => {
     const set = new Set<string>();
@@ -99,76 +109,234 @@ export function CatalogView({
     });
   }, [sourceList, selectedCategory, selectedVj]);
 
-  const featured = !searchQuery.trim() && filteredItems.length > 0 ? filteredItems[0] : null;
+  const [slideIndex, setSlideIndex] = useState(0);
+  const [isSliderPaused, setIsSliderPaused] = useState(false);
+
+  const featuredSlides = useMemo(() => {
+    if (searchQuery.trim() || filteredItems.length === 0) return [];
+
+    const hasRealTitle = (item: MediaItem) =>
+      Boolean(item.title && !/^Media #\d+$/i.test(item.title.trim()));
+
+    const isActionItem = (item: MediaItem) =>
+      /action/i.test(item.category_name || '') ||
+      /\b(fighter|war|kill|mission|prejudice|dawn|agents|dunkirk|heist|hunter|cyber)\b/i.test(
+        `${item.title || ''} ${item.description || ''}`
+      );
+
+    const isLatestItem = (item: MediaItem) =>
+      /latest/i.test(item.category_name || '');
+
+    if (selectedCategory === 'All' && selectedVj === 'All') {
+      const titled = filteredItems.filter(hasRealTitle);
+      const sourcePool = titled.length > 0 ? titled : filteredItems;
+
+      const actionPool = sourcePool.filter((m) => isActionItem(m));
+      const latestPool = sourcePool.filter((m) => isLatestItem(m) && !isActionItem(m));
+      const fallbackLatest = latestPool.length > 0 ? latestPool : sourcePool;
+
+      const combined: Array<{ item: MediaItem; trackLabel: 'Action' | 'Latest' }> = [];
+      const seen = new Set<number>();
+
+      const pushUnique = (item: MediaItem | undefined, trackLabel: 'Action' | 'Latest') => {
+        if (!item || seen.has(item.id)) return;
+        seen.add(item.id);
+        combined.push({ item, trackLabel });
+      };
+
+      const maxPairs = Math.max(fallbackLatest.length, actionPool.length);
+      for (let i = 0; i < maxPairs && combined.length < 12; i++) {
+        pushUnique(fallbackLatest[i], 'Latest');
+        if (combined.length >= 12) break;
+        pushUnique(actionPool[i], 'Action');
+      }
+
+      for (const item of sourcePool) {
+        if (combined.length >= 12) break;
+        pushUnique(item, isActionItem(item) ? 'Action' : 'Latest');
+      }
+
+      return combined;
+    }
+
+    const titledFiltered = filteredItems.filter(hasRealTitle);
+    const pool = (titledFiltered.length > 0 ? titledFiltered : filteredItems).slice(0, 12);
+    return pool.map((item) => ({
+      item,
+      trackLabel: (isActionItem(item) ? 'Action' : 'Latest') as 'Action' | 'Latest',
+    }));
+  }, [searchQuery, filteredItems, selectedCategory, selectedVj]);
+
+  useEffect(() => {
+    setSlideIndex(0);
+  }, [selectedCategory, selectedVj]);
+
+  useEffect(() => {
+    if (featuredSlides.length <= 1 || isSliderPaused) return;
+    const timer = window.setInterval(() => {
+      setSlideIndex((prev) => (prev + 1) % featuredSlides.length);
+    }, 3000);
+    return () => window.clearInterval(timer);
+  }, [featuredSlides.length, isSliderPaused]);
+
+  const activeSlideIndex =
+    featuredSlides.length > 0 ? slideIndex % featuredSlides.length : 0;
+  const activeSlide =
+    featuredSlides.length > 0 ? featuredSlides[activeSlideIndex] : null;
+  const featured = activeSlide?.item ?? null;
 
   return (
     <div className="space-y-8">
-      {featured && (
-        <section className="relative rounded-2xl overflow-hidden border border-slate-800 bg-slate-900 group">
-          <img
-            src={featured.backdrop || featured.image}
-            alt={featured.title}
-            referrerPolicy="no-referrer"
-            onError={(e) => {
-              e.currentTarget.src = FALLBACK_POSTER;
-            }}
-            className="absolute inset-0 w-full h-full object-cover opacity-45 group-hover:scale-105 transition-transform duration-700 ease-out"
-          />
-          <div className="absolute inset-0 bg-gradient-to-t from-slate-950 via-slate-950/75 to-transparent" />
-          <div className="absolute inset-0 bg-gradient-to-r from-slate-950 via-slate-950/70 to-transparent" />
+      {featured && activeSlide && (
+        <section
+          aria-roledescription="carousel"
+          aria-label="Featured Premiere Movies"
+          onMouseEnter={() => setIsSliderPaused(true)}
+          onMouseLeave={() => setIsSliderPaused(false)}
+          className="relative rounded-2xl overflow-hidden border border-slate-800 bg-slate-900 group min-h-[340px] sm:min-h-[400px] flex flex-col justify-end"
+        >
+          {featuredSlides.map((slide, idx) => {
+            const isActive = idx === activeSlideIndex;
+            return (
+              <img
+                key={slide.item.id}
+                src={slide.item.backdrop || slide.item.image}
+                alt={slide.item.title}
+                referrerPolicy="no-referrer"
+                onError={(e) => {
+                  e.currentTarget.style.opacity = '0';
+                }}
+                className={`absolute inset-0 w-full h-full object-cover transition-all duration-700 ease-out ${
+                  isActive
+                    ? 'opacity-45 scale-100 group-hover:scale-105'
+                    : 'opacity-0 scale-105 pointer-events-none'
+                }`}
+              />
+            );
+          })}
+          <div className="absolute inset-0 bg-gradient-to-t from-slate-950 via-slate-950/75 to-transparent pointer-events-none" />
+          <div className="absolute inset-0 bg-gradient-to-r from-slate-950 via-slate-950/70 to-transparent pointer-events-none" />
 
-          <div className="relative p-6 sm:p-10 lg:p-12 max-w-3xl space-y-4">
-            <div className="flex flex-wrap items-center gap-2 text-xs text-slate-300 tabular-nums">
-              <span className="font-semibold text-rose-400">Featured Premiere</span>
-              <span aria-hidden="true">·</span>
-              <span className="text-amber-300 font-medium">{featured.vj || 'VJ Junior'}</span>
-              <span aria-hidden="true">·</span>
-              <span className="font-mono">{featured.duration || '01h 45m'}</span>
-              <span aria-hidden="true">·</span>
-              <span className="font-mono">{featured.size || '1.1 GB'}</span>
-              <span aria-hidden="true">·</span>
-              <span className="font-mono text-emerald-400">{featured.quality || '1080p HD'}</span>
+          <div className="relative p-6 sm:p-10 lg:p-12 flex flex-col lg:flex-row lg:items-end justify-between gap-6">
+            <div key={featured.id} className="max-w-3xl space-y-4">
+              <div className="flex flex-wrap items-center gap-2 text-xs text-slate-300 tabular-nums">
+                <span className="font-semibold text-rose-400">Featured Premiere</span>
+                <span aria-hidden="true">·</span>
+                <span
+                  className={`font-semibold ${
+                    activeSlide.trackLabel === 'Action' ? 'text-cyan-300' : 'text-emerald-300'
+                  }`}
+                >
+                  {activeSlide.trackLabel} Movie
+                </span>
+                <span aria-hidden="true">·</span>
+                <span className="text-amber-300 font-medium">{featured.vj || 'VJ Junior'}</span>
+                <span aria-hidden="true">·</span>
+                <span className="font-mono">{featured.duration || '01h 45m'}</span>
+                <span aria-hidden="true">·</span>
+                <span className="font-mono">{featured.size || '1.1 GB'}</span>
+                <span aria-hidden="true">·</span>
+                <span className="font-mono text-emerald-400">{featured.quality || '1080p HD'}</span>
+              </div>
+
+              <h1 className="text-3xl sm:text-5xl font-extrabold tracking-tight text-white leading-tight [text-wrap:balance]">
+                {featured.title}
+              </h1>
+
+              <p className="text-sm sm:text-base text-slate-300 line-clamp-3 leading-relaxed max-w-2xl">
+                {featured.description}
+              </p>
+
+              <div className="pt-2 flex flex-wrap items-center gap-3">
+                <button
+                  type="button"
+                  onClick={() => onPlayItem(featured)}
+                  className="flex items-center gap-2 px-6 py-3 rounded-xl bg-rose-600 hover:bg-rose-500 text-white font-semibold text-sm transition-colors whitespace-nowrap shrink-0"
+                >
+                  <Play className="w-4 h-4 fill-white" />
+                  <span>Stream Now</span>
+                </button>
+
+                <a
+                  href={`/movie/${featured.id}`}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="flex items-center gap-2 px-4 py-3 rounded-xl bg-slate-900/90 hover:bg-slate-800 text-slate-200 border border-slate-700 font-medium text-sm transition-colors whitespace-nowrap shrink-0"
+                >
+                  <Terminal className="w-4 h-4 text-emerald-400" />
+                  <span>API JSON</span>
+                  <ExternalLink className="w-3.5 h-3.5 text-slate-400" />
+                </a>
+
+                <a
+                  href={`/movie/${featured.id}/play`}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="flex items-center gap-2 px-4 py-3 rounded-xl bg-slate-900/90 hover:bg-slate-800 text-slate-200 border border-slate-700 font-medium text-sm transition-colors whitespace-nowrap shrink-0"
+                >
+                  <Download className="w-4 h-4 text-cyan-400" />
+                  <span>Direct Stream</span>
+                </a>
+              </div>
             </div>
 
-            <h1 className="text-3xl sm:text-5xl font-extrabold tracking-tight text-white leading-tight [text-wrap:balance]">
-              {featured.title}
-            </h1>
+            {featuredSlides.length > 1 && (
+              <div className="flex flex-col sm:flex-row lg:flex-col items-start sm:items-center lg:items-end gap-3 shrink-0">
+                <div className="flex items-center gap-2">
+                  <span className="text-xs font-mono text-slate-300 tabular-nums mr-1">
+                    {String(activeSlideIndex + 1).padStart(2, '0')} /{' '}
+                    {String(featuredSlides.length).padStart(2, '0')}
+                  </span>
+                  <button
+                    type="button"
+                    aria-label="Previous featured movie"
+                    onClick={() =>
+                      setSlideIndex(
+                        (prev) => (prev - 1 + featuredSlides.length) % featuredSlides.length
+                      )
+                    }
+                    className="p-2 rounded-lg bg-slate-900/90 hover:bg-slate-800 text-slate-200 border border-slate-700 transition-colors"
+                  >
+                    <ChevronLeft className="w-4 h-4" />
+                  </button>
+                  <button
+                    type="button"
+                    aria-label="Next featured movie"
+                    onClick={() =>
+                      setSlideIndex((prev) => (prev + 1) % featuredSlides.length)
+                    }
+                    className="p-2 rounded-lg bg-slate-900/90 hover:bg-slate-800 text-slate-200 border border-slate-700 transition-colors"
+                  >
+                    <ChevronRight className="w-4 h-4" />
+                  </button>
+                </div>
 
-            <p className="text-sm sm:text-base text-slate-300 line-clamp-3 leading-relaxed max-w-2xl">
-              {featured.description}
-            </p>
-
-            <div className="pt-2 flex flex-wrap items-center gap-3">
-              <button
-                type="button"
-                onClick={() => onPlayItem(featured)}
-                className="flex items-center gap-2 px-6 py-3 rounded-xl bg-rose-600 hover:bg-rose-500 text-white font-semibold text-sm transition-colors whitespace-nowrap shrink-0"
-              >
-                <Play className="w-4 h-4 fill-white" />
-                <span>Stream Now</span>
-              </button>
-
-              <a
-                href={`/movie/${featured.id}`}
-                target="_blank"
-                rel="noreferrer"
-                className="flex items-center gap-2 px-4 py-3 rounded-xl bg-slate-900/90 hover:bg-slate-800 text-slate-200 border border-slate-700 font-medium text-sm transition-colors whitespace-nowrap shrink-0"
-              >
-                <Terminal className="w-4 h-4 text-emerald-400" />
-                <span>API JSON</span>
-                <ExternalLink className="w-3.5 h-3.5 text-slate-400" />
-              </a>
-
-              <a
-                href={`/movie/${featured.id}/play`}
-                target="_blank"
-                rel="noreferrer"
-                className="flex items-center gap-2 px-4 py-3 rounded-xl bg-slate-900/90 hover:bg-slate-800 text-slate-200 border border-slate-700 font-medium text-sm transition-colors whitespace-nowrap shrink-0"
-              >
-                <Download className="w-4 h-4 text-cyan-400" />
-                <span>Direct Stream</span>
-              </a>
-            </div>
+                <div
+                  className="flex items-center gap-1.5"
+                  role="tablist"
+                  aria-label="Select featured movie slide"
+                >
+                  {featuredSlides.map((slide, idx) => {
+                    const isActive = idx === activeSlideIndex;
+                    return (
+                      <button
+                        key={slide.item.id}
+                        type="button"
+                        role="tab"
+                        aria-selected={isActive}
+                        aria-label={`Slide ${idx + 1}: ${slide.item.title}`}
+                        onClick={() => setSlideIndex(idx)}
+                        className={`h-1.5 rounded-full transition-all duration-300 ${
+                          isActive
+                            ? 'w-7 bg-rose-500'
+                            : 'w-2.5 bg-slate-600/80 hover:bg-slate-400'
+                        }`}
+                      />
+                    );
+                  })}
+                </div>
+              </div>
+            )}
           </div>
         </section>
       )}
@@ -452,7 +620,7 @@ export function CatalogView({
                     referrerPolicy="no-referrer"
                     loading="lazy"
                     onError={(e) => {
-                      e.currentTarget.src = FALLBACK_POSTER;
+                      e.currentTarget.style.opacity = '0';
                     }}
                     className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-500"
                   />

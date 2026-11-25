@@ -14,8 +14,8 @@ import {
   SERIES_CATALOG,
   WORKER_CODE_DATA,
   findAllMediaItems,
-} from './server/data.js';
-import type { LiveChannel, MediaItem, SeriesRecord, SeriesSeason } from './src/types.js';
+} from './server/data.ts';
+import type { LiveChannel, MediaItem, SeriesRecord, SeriesSeason } from './src/types.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -23,25 +23,110 @@ const __dirname = path.dirname(__filename);
 const PORT = Number(process.env.PORT) || 3000;
 const UPSTREAM_SOURCE = process.env.UPSTREAM_API_URL?.trim() || 'https://mumowatch.ai.studio';
 const UPSTREAM_KEY = process.env.UPSTREAM_API_KEY?.trim() || '';
-function resolveLocalAsset(relPath: string): string | undefined {
-  const cleanRel = relPath.replace(/^\/+/, '');
-  const devCandidate = path.resolve(__dirname, cleanRel);
-  if (fs.existsSync(devCandidate)) return devCandidate;
-  const distCandidate = path.resolve(__dirname, 'dist', cleanRel);
-  if (fs.existsSync(distCandidate)) return distCandidate;
-  return undefined;
-}
-
-const FALLBACK_IMAGE_REL = 'src/assets/images/cinema_hero_premiere_1795637611164.jpg';
 const MEDIA_FETCH_UA = 'Mozilla/5.0 (compatible; UGShacksGateway/1.0)';
 const MAX_REGISTRY_SIZE = 5000;
+const BAN_DURATION_MS = 15 * 60 * 1000;
+const RATE_LIMIT_WINDOW_MS = 10 * 1000;
+const API_BURST_LIMIT = 45;
 
 // Private server-only registries — never serialized or exposed to clients
 const videoRegistry = new Map<string, { url: string; title: string }>();
 const imageRegistry = new Map<string, string>();
 const seriesCodeIndex = new Map<string, string>();
+const bannedIpUntil = new Map<string, number>();
+const ipRateWindow = new Map<string, { count: number; resetAt: number }>();
 let warmPromise: Promise<void> | null = null;
 let lastWarmAt = 0;
+
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+const SAFE_ID_REGEX = /^[a-zA-Z0-9_-]{1,64}$/;
+const HARD_SCRAPER_UA_REGEX =
+  /(httrack|webcopier|teleport|sitesucker|offline explorer|scrapy|beautifulsoup|mechanize|colly|nikto|sqlmap|nmap|masscan|nuclei|dirbuster|gobuster|ffuf|zgrab|wpscan|acunetix|nessus|openvas|arachni|havij|headlesschrome|phantomjs|puppeteer|playwright|selenium|ahrefsbot|semrushbot|mj12bot|dotbot|bytespider|petalbot|blexbot|dataforseobot|gptbot|ccbot|claudebot|wget\/)/i;
+const CLI_HTML_SCRAPER_UA_REGEX =
+  /(curl\/|python-requests|python-urllib|aiohttp|httpx|go-http-client|java\/|apache-httpclient|libwww-perl|lwp-trivial|okhttp|axios\/|undici|node-fetch)/i;
+const PROBE_PATH_REGEX =
+  /(\/\.env|\/\.git|\/\.svn|\/\.htaccess|\/\.htpasswd|\/wp-admin|\/wp-login|\/wp-content|\/xmlrpc\.php|\/phpmyadmin|\/pma\b|\/admin\.php|\/config\.php|\/cgi-bin|\/server-status|\/actuator|\/swagger|\/etc\/passwd|\/proc\/self|\.\.%2f|\.\.\/|\0)/i;
+const EXPLOIT_PAYLOAD_REGEX =
+  /(<script\b|javascript:|vbscript:|onload\s*=|onerror\s*=|\bunion\b[\s+/%0-9a-zA-Z/*]+\bselect\b|\bdrop\s+table\b|\binformation_schema\b|\bwaitfor\s+delay\b|\bsleep\s*\(|\bexec\s*\()/i;
+
+function getClientIp(req: Request): string {
+  const fwd = (req.headers['x-forwarded-for'] as string | undefined)
+    ?.split(',')[0]
+    ?.trim();
+  return fwd || req.ip || req.socket.remoteAddress || 'unknown';
+}
+
+function isLocalClientIp(ip: string): boolean {
+  return ip === '127.0.0.1' || ip === '::1' || ip === '::ffff:127.0.0.1';
+}
+
+function banClientIp(ip: string): void {
+  if (!ip || ip === 'unknown' || isLocalClientIp(ip)) return;
+  setBoundedMap(bannedIpUntil, ip, Date.now() + BAN_DURATION_MS);
+}
+
+function renderAntiScraperTrapHtml(reason = 'Scraper & Bot Activity Blocked'): string {
+  const safeReason = escapeHtml(reason);
+  const warnings = [
+    'THIEF! SCAMMER! STOP TRYING TO SCRAPE THIS SITE!',
+    'STUPID BOT DETECTED — YOU ARE MAD THINKING YOU CAN STEAL UG SHACKS!',
+    'SCRAPER BLOCKED! NO CONTENT FOR THIEVES AND SCAMMERS!',
+    'NICE TRY SCAMMER — GO BUILD YOUR OWN SITE INSTEAD OF STEALING!',
+    'AUTOMATED CLONER JAILED — ACCESS PERMANENTLY DENIED!',
+  ];
+  const repeatedBlocks = Array.from({ length: 18 }, (_, i) => {
+    const msg = warnings[i % warnings.length];
+    return `<section data-trap="thief-scammer-blocked-${i}">
+      <h2>${escapeHtml(msg)}</h2>
+      <p>Stupid scraper! Scammer! Thief! Stop scraping UG SHACKS! You're mad — go away, nothing to steal here! Every byte you download is a decoy trap.</p>
+      <a href="/_trap/scraper-jail?round=${i + 1}" rel="nofollow">Continue Scraping Decoy Trap #${i + 1}</a>
+    </section>`;
+  }).join('\n');
+
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="robots" content="noindex, nofollow, noarchive, nosnippet" />
+  <title>ACCESS DENIED — THIEF / SCAMMER / SCRAPER BLOCKED</title>
+  <style>
+    body { margin: 0; background: #090306; color: #fda4af; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; padding: 32px 20px; line-height: 1.6; }
+    .box { max-width: 780px; margin: 0 auto; border: 2px solid #e11d48; border-radius: 16px; padding: 28px; background: #14050a; }
+    h1 { color: #fb7185; margin-top: 0; font-size: 24px; text-transform: uppercase; }
+    h2 { color: #fecdd3; font-size: 16px; margin-bottom: 4px; }
+    p { color: #fda4af; font-size: 14px; }
+    .reason { display: inline-block; padding: 4px 10px; border-radius: 6px; background: #881337; color: #fff; font-size: 12px; font-weight: 700; margin-bottom: 16px; }
+    a { color: #fb7185; font-size: 12px; }
+  </style>
+</head>
+<body>
+  <!-- STUPID SCRAPER! THIEF! SCAMMER! YOU'RE MAD — STOP STEALING THIS WEBSITE! -->
+  <main class="box">
+    <span class="reason">HTTP 403 · ${safeReason}</span>
+    <h1>STOP SCRAPING! THIEF &amp; SCAMMER BLOCKED!</h1>
+    <p>Hey thief, scammer, stupid scraper — you're mad if you think you can scrape, clone, or hack UG SHACKS. Your scraper signature has been logged and jailed.</p>
+    ${repeatedBlocks}
+  </main>
+</body>
+</html>`;
+}
+
+function sendAntiScraperTrap(res: Response, reason: string): void {
+  res.status(403);
+  res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+  res.setHeader('X-Robots-Tag', 'noindex, nofollow, noarchive, nosnippet');
+  res.send(renderAntiScraperTrapHtml(reason));
+}
 
 function setBoundedMap<K, V>(map: Map<K, V>, key: K, val: V): void {
   if (map.size >= MAX_REGISTRY_SIZE && !map.has(key)) {
@@ -131,9 +216,9 @@ function toPublicMediaItem(raw: Partial<MediaItem>, baseUrl: string): MediaItem 
     }
   }
 
-  const publicImage = raw.image ? `${baseUrl}/img/m/${idStr}.jpg` : `${baseUrl}/img/m/default.jpg`;
+  const publicImage = raw.image ? safeExternalUrl(raw.image) : '';
   const publicBackdrop = raw.backdrop
-    ? `${baseUrl}/img/b/${idStr}.jpg`
+    ? safeExternalUrl(raw.backdrop)
     : publicImage;
   const publicStream = `${baseUrl}/stream/${idStr}`;
 
@@ -174,7 +259,6 @@ function toPublicMediaItem(raw: Partial<MediaItem>, baseUrl: string): MediaItem 
 
 function toPublicSeries(raw: Partial<SeriesRecord>, baseUrl: string): SeriesRecord {
   const rawSeriesKey = String(raw.series_code || raw.slug || 'series').trim();
-  const encodedSeriesKey = encodeURIComponent(rawSeriesKey);
   if (raw.image) {
     registerImage(`s:${rawSeriesKey}`, raw.image);
     if (raw.slug) registerImage(`s:${String(raw.slug).trim()}`, raw.image);
@@ -184,14 +268,11 @@ function toPublicSeries(raw: Partial<SeriesRecord>, baseUrl: string): SeriesReco
       });
     }
   }
-  const publicSeriesImage = raw.image
-    ? `${baseUrl}/img/s/${encodedSeriesKey}.jpg`
-    : `${baseUrl}/img/m/default.jpg`;
+  const publicSeriesImage = raw.image ? safeExternalUrl(raw.image) : '';
 
   const seasons: SeriesSeason[] = Array.isArray(raw.seasons)
     ? raw.seasons.map((season) => {
         const rawSeasonKey = String(season.series_code || `${rawSeriesKey}-s${season.season}`).trim();
-        const encodedSeasonKey = encodeURIComponent(rawSeasonKey);
         if (season.image) {
           registerImage(`s:${rawSeasonKey}`, season.image);
         }
@@ -199,7 +280,7 @@ function toPublicSeries(raw: Partial<SeriesRecord>, baseUrl: string): SeriesReco
           season: season.season,
           title: sanitizeText(season.title, `Season ${season.season}`),
           series_code: String(season.series_code || ''),
-          image: season.image ? `${baseUrl}/img/s/${encodedSeasonKey}.jpg` : publicSeriesImage,
+          image: season.image ? safeExternalUrl(season.image) : publicSeriesImage,
           vj: sanitizeText(season.vj, 'VJ Junior') || 'VJ Junior',
           count: Number(season.count || season.episodes?.length || 0),
           episodes: Array.isArray(season.episodes)
@@ -262,7 +343,7 @@ function toPublicChannel(raw: Partial<LiveChannel>, baseUrl: string): LiveChanne
     currentShow: sanitizeText(raw.currentShow, 'Live Feature'),
     vj: sanitizeText(raw.vj, 'VJ Junior') || 'VJ Junior',
     viewers: String(raw.viewers || '8.5K Watching'),
-    thumbnail: raw.thumbnail ? `${baseUrl}/img/c/${id}.jpg` : `${baseUrl}/img/m/default.jpg`,
+    thumbnail: raw.thumbnail ? safeExternalUrl(raw.thumbnail) : '',
     playingurl: `${baseUrl}/stream/${id}`,
     edgeNode: `edge-${id}.ugshacks.api`,
   };
@@ -538,10 +619,163 @@ async function createApp() {
     );
     res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
     res.setHeader('Referrer-Policy', 'no-referrer');
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('X-DNS-Prefetch-Control', 'off');
+    res.setHeader('X-Download-Options', 'noopen');
+    res.setHeader('X-Permitted-Cross-Domain-Policies', 'none');
+    res.setHeader(
+      'Permissions-Policy',
+      'camera=(), microphone=(), geolocation=(), payment=(), usb=()'
+    );
+    if (req.secure || req.headers['x-forwarded-proto'] === 'https') {
+      res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+    }
+
     if (req.method === 'OPTIONS') {
       res.status(204).end();
       return;
     }
+
+    if (req.method !== 'GET' && req.method !== 'HEAD') {
+      res.status(405).json({ error: 'Method Not Allowed' });
+      return;
+    }
+
+    next();
+  });
+
+  app.get('/robots.txt', (_req: Request, res: Response) => {
+    res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+    res.send(
+      [
+        'User-agent: *',
+        'Disallow: /_trap/',
+        'Disallow: /api/',
+        'Disallow: /stream/',
+        'User-agent: HTTrack',
+        'Disallow: /',
+        'User-agent: Scrapy',
+        'Disallow: /',
+        'User-agent: Bytespider',
+        'Disallow: /',
+        'User-agent: GPTBot',
+        'Disallow: /',
+        'User-agent: CCBot',
+        'Disallow: /',
+      ].join('\n')
+    );
+  });
+
+  // Security shield: anti-scraper tarpit, probe defense, and burst limiter
+  app.use((req, res, next) => {
+    const ip = getClientIp(req);
+    const ua = String(req.headers['user-agent'] || '').trim();
+    const rawUrl = String(req.originalUrl || req.url || '');
+    const reqPath = String(req.path || '/');
+    const accept = String(req.headers.accept || '').toLowerCase();
+
+    // 1. Check active IP jail
+    const bannedUntil = bannedIpUntil.get(ip);
+    if (bannedUntil && bannedUntil > Date.now()) {
+      sendAntiScraperTrap(res, 'IP Temporarily Jailed');
+      return;
+    }
+    if (bannedUntil && bannedUntil <= Date.now()) {
+      bannedIpUntil.delete(ip);
+    }
+
+    // 2. Honeypot trap routes -> instant IP jail + decoy HTML
+    if (reqPath.startsWith('/_trap')) {
+      banClientIp(ip);
+      sendAntiScraperTrap(res, 'Honeypot Trap Triggered');
+      return;
+    }
+
+    // 3. Block known vulnerability scanners, path traversal, and injection payloads
+    let decodedUrl = rawUrl;
+    try {
+      decodedUrl = decodeURIComponent(rawUrl);
+    } catch {
+      decodedUrl = rawUrl;
+    }
+    if (PROBE_PATH_REGEX.test(rawUrl) || PROBE_PATH_REGEX.test(decodedUrl)) {
+      banClientIp(ip);
+      sendAntiScraperTrap(res, 'Unauthorized Probe Blocked');
+      return;
+    }
+    if (EXPLOIT_PAYLOAD_REGEX.test(rawUrl) || EXPLOIT_PAYLOAD_REGEX.test(decodedUrl)) {
+      banClientIp(ip);
+      sendAntiScraperTrap(res, 'Malicious Payload Blocked');
+      return;
+    }
+
+    // 4. Block dedicated scrapers, site cloners, and headless automation everywhere
+    if (HARD_SCRAPER_UA_REGEX.test(ua)) {
+      banClientIp(ip);
+      sendAntiScraperTrap(res, 'Automated Scraper Blocked');
+      return;
+    }
+
+    // 5. Block CLI / raw HTTP clients trying to scrape frontend HTML / source files
+    const isFrontendHtmlOrBundle =
+      reqPath === '/' ||
+      reqPath === '/index.html' ||
+      reqPath.startsWith('/src/') ||
+      reqPath.startsWith('/assets/') ||
+      reqPath.startsWith('/@vite/');
+    const wantsHtmlPage =
+      accept.includes('text/html') &&
+      !reqPath.startsWith('/stream/') &&
+      !reqPath.startsWith('/movie/') &&
+      !reqPath.startsWith('/api/');
+
+    if (
+      (!ua && !reqPath.startsWith('/stream/') && !reqPath.startsWith('/img/')) ||
+      ((isFrontendHtmlOrBundle || wantsHtmlPage) &&
+        CLI_HTML_SCRAPER_UA_REGEX.test(ua) &&
+        !accept.includes('application/json'))
+    ) {
+      sendAntiScraperTrap(res, 'HTML Scraping Blocked');
+      return;
+    }
+
+    // 6. Burst rate limiter on API/HTML routes (excludes byte-range video, artwork, and Vite dev assets)
+    const exemptFromBurstLimit =
+      reqPath.startsWith('/stream/') ||
+      (reqPath.startsWith('/movie/') && reqPath.endsWith('/play')) ||
+      reqPath.startsWith('/img/') ||
+      reqPath.startsWith('/assets/') ||
+      reqPath.startsWith('/src/') ||
+      reqPath.startsWith('/@') ||
+      reqPath.startsWith('/node_modules/');
+
+    if (!exemptFromBurstLimit && !isLocalClientIp(ip)) {
+      const now = Date.now();
+      const entry = ipRateWindow.get(ip);
+      if (!entry || entry.resetAt <= now) {
+        setBoundedMap(ipRateWindow, ip, { count: 1, resetAt: now + RATE_LIMIT_WINDOW_MS });
+      } else {
+        entry.count += 1;
+        if (entry.count > API_BURST_LIMIT) {
+          banClientIp(ip);
+          sendAntiScraperTrap(res, 'Scraper Burst Limit Exceeded');
+          return;
+        }
+      }
+    }
+
+    // Apply Content-Security-Policy on frontend document responses
+    if (isFrontendHtmlOrBundle && (reqPath === '/' || reqPath === '/index.html')) {
+      const scriptPolicy =
+        process.env.NODE_ENV !== 'production'
+          ? "'self' 'unsafe-inline' 'unsafe-eval'"
+          : "'self' 'unsafe-inline'";
+      res.setHeader(
+        'Content-Security-Policy',
+        `default-src 'self'; script-src ${scriptPolicy}; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com data:; img-src 'self' https: data: blob:; media-src 'self' https: blob:; connect-src 'self' https:; object-src 'none'; base-uri 'self'`
+      );
+    }
+
     next();
   });
 
@@ -570,6 +804,10 @@ async function createApp() {
     });
   });
 
+  const isHiddenFromDashboard = (m: Partial<MediaItem>): boolean =>
+    Number(m.id) === 67861 ||
+    /rachael\s*magoola|rachel\s*magoola/i.test(`${m.title || ''} ${m.description || ''}`);
+
   app.get('/dashboard', async (req: Request, res: Response) => {
     const baseUrl = getPublicOrigin(req);
     const upstream = await tryUpstreamJson<{
@@ -583,25 +821,33 @@ async function createApp() {
         ...sec,
         category: sanitizeText(sec.category, sec.category),
       }));
-      const movies = upstream.movies.map((m) => toPublicMediaItem(m, baseUrl));
+      const movies = upstream.movies
+        .map((m) => toPublicMediaItem(m, baseUrl))
+        .filter((m) => !isHiddenFromDashboard(m));
       res.json({
         sections,
-        unique_movies: upstream.unique_movies ?? movies.length,
+        unique_movies: movies.length,
         movies,
       });
       return;
     }
 
+    const fallbackMovies = CATALOG_MOVIES.map((m) => toPublicMediaItem(m, baseUrl)).filter(
+      (m) => !isHiddenFromDashboard(m)
+    );
     res.json({
       sections: DASHBOARD_SECTIONS,
-      unique_movies: CATALOG_MOVIES.length,
-      movies: CATALOG_MOVIES.map((m) => toPublicMediaItem(m, baseUrl)),
+      unique_movies: fallbackMovies.length,
+      movies: fallbackMovies,
     });
   });
 
   app.get('/search', async (req: Request, res: Response) => {
     const baseUrl = getPublicOrigin(req);
-    const query = String(req.query.q || '').trim();
+    const query = String(req.query.q || '')
+      .replace(/[\0\r\n]/g, '')
+      .trim()
+      .slice(0, 120);
     const typeFilter = String(req.query.type || 'all').trim().toLowerCase();
 
     const upstream = await tryUpstreamJson<{
@@ -687,6 +933,10 @@ async function createApp() {
   app.get('/movie/:id', async (req: Request, res: Response) => {
     const baseUrl = getPublicOrigin(req);
     const id = String(req.params.id || '');
+    if (!SAFE_ID_REGEX.test(id)) {
+      res.status(400).json({ error: 'Invalid media ID' });
+      return;
+    }
     const raw = await fetchRawMediaById(id);
     if (!raw) {
       res.status(404).json({ error: `Media #${id} not found` });
@@ -698,6 +948,10 @@ async function createApp() {
   app.get('/api/preview/v2/:vid', async (req: Request, res: Response) => {
     const baseUrl = getPublicOrigin(req);
     const vid = String(req.params.vid || '');
+    if (!SAFE_ID_REGEX.test(vid)) {
+      res.status(400).json({ error: 'Invalid preview ID' });
+      return;
+    }
     const raw = await fetchRawMediaById(vid);
     if (!raw) {
       res.status(404).json({ error: `Preview #${vid} not found` });
@@ -722,6 +976,10 @@ async function createApp() {
   app.get('/series/:id', async (req: Request, res: Response) => {
     const baseUrl = getPublicOrigin(req);
     const key = String(req.params.id || '');
+    if (!SAFE_ID_REGEX.test(key)) {
+      res.status(400).json({ error: 'Invalid series identifier' });
+      return;
+    }
     const resolved = await resolveLiveSeries(key);
     if (!resolved) {
       res.json({
@@ -732,7 +990,7 @@ async function createApp() {
         season_count: 0,
         episode_count: 0,
         count: 0,
-        image: `${baseUrl}/img/m/default.jpg`,
+        image: '',
         vj: 'VJ Junior',
         description: '',
         seasons: [],
@@ -744,34 +1002,16 @@ async function createApp() {
     res.json(toPublicSeries(resolved, baseUrl));
   });
 
-  // Self-hosted image proxy: streams real artwork through UG SHACKS URL without leaking origin domains
+  // Real image proxy endpoint: streams real upstream artwork with zero generated placeholder images
   app.get('/img/:kind/:key', async (req: Request, res: Response) => {
     const kind = String(req.params.kind || 'm').toLowerCase();
     const rawKey = String(req.params.key || '').replace(/\.(jpg|jpeg|png|webp)$/i, '');
-    const fallbackAsset = resolveLocalAsset(FALLBACK_IMAGE_REL);
-
-    if (rawKey === 'default') {
-      if (fallbackAsset) {
-        res.setHeader('Content-Type', 'image/jpeg');
-        res.setHeader('Cache-Control', 'public, max-age=86400');
-        res.sendFile(fallbackAsset);
-        return;
-      }
-      res.status(404).end();
+    if (!/^[a-z]$/.test(kind) || !SAFE_ID_REGEX.test(rawKey)) {
+      res.status(400).end();
       return;
     }
 
     const targetImageUrl = await resolveImageTarget(kind, rawKey);
-
-    if (targetImageUrl && targetImageUrl.startsWith('/')) {
-      const localPath = resolveLocalAsset(targetImageUrl);
-      if (localPath) {
-        res.setHeader('Content-Type', 'image/jpeg');
-        res.setHeader('Cache-Control', 'public, max-age=86400');
-        res.sendFile(localPath);
-        return;
-      }
-    }
 
     if (targetImageUrl && /^https?:\/\//i.test(targetImageUrl)) {
       try {
@@ -800,29 +1040,14 @@ async function createApp() {
           return;
         }
       } catch {
-        // Fall through to local fallback artwork
+        // Real image fetch failed
       }
     }
 
-    if (fallbackAsset) {
-      res.setHeader('Content-Type', 'image/jpeg');
-      res.setHeader('Cache-Control', 'public, max-age=3600');
-      res.sendFile(fallbackAsset);
-      return;
-    }
     res.status(404).end();
   });
 
   const MAX_STREAM_CHUNK = 4 * 1024 * 1024; // 4 MB keeps every Cloud Run HTTP response well under 32 MB
-
-  function escapeHtml(value: string): string {
-    return value
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;')
-      .replace(/"/g, '&quot;')
-      .replace(/'/g, '&#39;');
-  }
 
   function buildBoundedRangeHeader(rangeHeader?: string): string {
     if (!rangeHeader) {
@@ -892,7 +1117,10 @@ async function createApp() {
     .btn { padding: 8px 12px; border-radius: 8px; background: #1e293b; color: #f1f5f9; text-decoration: none; font-size: 12px; font-weight: 600; border: 1px solid #334155; }
     .btn:hover { background: #334155; }
     main { flex: 1; display: flex; align-items: center; justify-content: center; padding: 16px; background: #000; }
-    video { width: 100%; max-width: 1120px; max-height: 82vh; background: #000; border-radius: 12px; border: 1px solid #1e293b; outline: none; }
+    .stage { position: relative; width: 100%; max-width: 1120px; display: flex; align-items: center; justify-content: center; }
+    video { width: 100%; max-height: 82vh; background: #000; border-radius: 12px; border: 1px solid #1e293b; outline: none; }
+    .unmute-btn { position: absolute; top: 16px; right: 16px; z-index: 10; padding: 9px 14px; border-radius: 999px; border: 1px solid rgba(255,255,255,0.25); background: rgba(225,29,72,0.92); color: #fff; font-size: 12px; font-weight: 700; cursor: pointer; box-shadow: 0 8px 24px rgba(0,0,0,0.45); }
+    .unmute-btn:hover { background: #e11d48; }
   </style>
 </head>
 <body>
@@ -905,8 +1133,52 @@ async function createApp() {
     </div>
   </header>
   <main>
-    <video controls autoplay playsinline preload="metadata" poster="${escapeHtml(posterUrl)}" src="${escapeHtml(streamUrl)}"></video>
+    <div class="stage">
+      <button id="unmuteBtn" type="button" class="unmute-btn" hidden>Tap to Unmute Sound</button>
+      <video id="player" controls autoplay playsinline preload="auto" poster="${escapeHtml(posterUrl)}" src="${escapeHtml(streamUrl)}"></video>
+    </div>
   </main>
+  <script>
+    (function () {
+      var v = document.getElementById('player');
+      var btn = document.getElementById('unmuteBtn');
+      if (!v) return;
+      function showUnmute() { if (btn) btn.hidden = false; }
+      function hideUnmute() { if (btn) btn.hidden = true; }
+      if (btn) {
+        btn.addEventListener('click', function () {
+          v.muted = false;
+          v.volume = 1;
+          var p = v.play();
+          if (p && p.catch) p.catch(function () {});
+          hideUnmute();
+        });
+      }
+      v.addEventListener('volumechange', function () {
+        if (!v.muted) hideUnmute();
+      });
+      function startAutoPlay() {
+        var p = v.play();
+        if (p && typeof p.catch === 'function') {
+          p.catch(function () {
+            v.muted = true;
+            var mp = v.play();
+            if (mp && typeof mp.then === 'function') {
+              mp.then(showUnmute).catch(function () {});
+            } else {
+              showUnmute();
+            }
+          });
+        }
+      }
+      if (v.readyState >= 2) {
+        startAutoPlay();
+      } else {
+        v.addEventListener('canplay', startAutoPlay, { once: true });
+        startAutoPlay();
+      }
+    })();
+  </script>
 </body>
 </html>`;
   }
@@ -1033,6 +1305,10 @@ async function createApp() {
   ) => {
     const baseUrl = getPublicOrigin(req);
     const id = String(req.params.id || '');
+    if (!SAFE_ID_REGEX.test(id)) {
+      res.status(400).json({ error: 'Invalid stream ID' });
+      return;
+    }
     const resolved = await resolveVideoTarget(id);
 
     if (!resolved?.url) {
@@ -1196,7 +1472,7 @@ async function createApp() {
                   preview: {
                     id: 57865,
                     title: 'Neon Hunter: Cyber Protocol',
-                    image: `${baseUrl}/img/m/57865.jpg`,
+                    image: 'https://apposters.b-cdn.net/laba/yo/naki/8bQz2758.jpg',
                     playingUrl: `${baseUrl}/stream/57865`,
                     nxt_playing_url: `${baseUrl}/stream/57865`,
                     streamUrl: `${baseUrl}/stream/57865`,
@@ -1211,7 +1487,7 @@ async function createApp() {
                     vj: 'VJ Junior',
                     size: '1.84 GB',
                     duration: '01h 24m',
-                    image: `${baseUrl}/img/m/67861.jpg`,
+                    image: 'https://apposters.b-cdn.net/laba/yo/naki/g9nG1626.jpg',
                     playingurl: `${baseUrl}/stream/67861`,
                     streamurl: `${baseUrl}/stream/67861`,
                   }
@@ -1222,7 +1498,7 @@ async function createApp() {
                       series_code: '91002',
                       season_count: 3,
                       episode_count: 30,
-                      image: `${baseUrl}/img/s/91002.jpg`,
+                      image: 'https://apposters.b-cdn.net/laba/yo/naki/EiU52ws1PI3828.jpg',
                       sampleStream: `${baseUrl}/stream/${sampleId}`,
                     }
                   : '',

@@ -1,5 +1,5 @@
-import { Download, ExternalLink, Play, Server, TriangleAlert, X } from 'lucide-react';
-import { useMemo, useRef, useState } from 'react';
+import { Download, ExternalLink, Play, Server, TriangleAlert, Volume2, X } from 'lucide-react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import type { MediaItem } from '../types';
 import { normalizeMediaUrl } from '../utils/media';
 
@@ -11,6 +11,7 @@ interface VideoModalProps {
 export function VideoModal({ item, onClose }: VideoModalProps) {
   const [streamMode, setStreamMode] = useState<'stream' | 'play'>('stream');
   const [videoFailed, setVideoFailed] = useState(false);
+  const [needsUnmute, setNeedsUnmute] = useState(false);
   const videoRef = useRef<HTMLVideoElement | null>(null);
 
   const isLiveChannel = item.category_id === 'live';
@@ -22,6 +23,22 @@ export function VideoModal({ item, onClose }: VideoModalProps) {
     }
     return item.streamurl || normalizeMediaUrl(item.playingurl) || `/stream/${mediaKey}`;
   }, [item, mediaKey, streamMode]);
+
+  useEffect(() => {
+    const el = videoRef.current;
+    if (!el || !activeSrc || videoFailed) return;
+    setNeedsUnmute(false);
+    el.muted = false;
+    const playPromise = el.play();
+    if (playPromise && typeof playPromise.catch === 'function') {
+      playPromise.catch(() => {
+        el.muted = true;
+        el.play()
+          .then(() => setNeedsUnmute(true))
+          .catch(() => {});
+      });
+    }
+  }, [activeSrc, videoFailed]);
 
   return (
     <div
@@ -67,24 +84,48 @@ export function VideoModal({ item, onClose }: VideoModalProps) {
 
         <div className="relative aspect-video bg-black flex items-center justify-center">
           {activeSrc && !videoFailed ? (
-            <video
-              key={activeSrc}
-              ref={videoRef}
-              src={activeSrc}
-              poster={item.backdrop || item.image}
-              controls
-              autoPlay
-              playsInline
-              preload="metadata"
-              onError={() => {
-                if (streamMode === 'stream' && mediaKey) {
-                  setStreamMode('play');
-                } else {
-                  setVideoFailed(true);
-                }
-              }}
-              className="w-full h-full object-contain"
-            />
+            <>
+              <video
+                key={activeSrc}
+                ref={videoRef}
+                src={activeSrc}
+                poster={item.backdrop || item.image}
+                controls
+                autoPlay
+                playsInline
+                preload="auto"
+                onVolumeChange={() => {
+                  if (videoRef.current && !videoRef.current.muted) {
+                    setNeedsUnmute(false);
+                  }
+                }}
+                onError={() => {
+                  if (streamMode === 'stream' && mediaKey) {
+                    setStreamMode('play');
+                  } else {
+                    setVideoFailed(true);
+                  }
+                }}
+                className="w-full h-full object-contain"
+              />
+              {needsUnmute && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (videoRef.current) {
+                      videoRef.current.muted = false;
+                      videoRef.current.volume = 1;
+                      videoRef.current.play().catch(() => {});
+                    }
+                    setNeedsUnmute(false);
+                  }}
+                  className="absolute top-3 right-3 z-10 flex items-center gap-1.5 px-3.5 py-2 rounded-full bg-rose-600 hover:bg-rose-500 text-white text-xs font-bold shadow-lg transition-colors"
+                >
+                  <Volume2 className="w-3.5 h-3.5" />
+                  <span>Tap to Unmute</span>
+                </button>
+              )}
+            </>
           ) : (
             <div className="text-center p-8 space-y-3">
               <TriangleAlert className="w-10 h-10 text-amber-500 mx-auto" />

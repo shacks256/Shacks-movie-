@@ -1,6 +1,6 @@
 import { LoaderCircle, Play, Radio, Server, Wifi } from 'lucide-react';
 import type { LiveChannel, MediaItem } from '../types';
-import { FALLBACK_POSTER, normalizeMediaUrl } from '../utils/media';
+import { normalizeMediaUrl } from '../utils/media';
 
 interface ChannelsViewProps {
   channels: LiveChannel[];
@@ -48,7 +48,7 @@ export function ChannelsView({
                   alt={activeChannel.name}
                   referrerPolicy="no-referrer"
                   onError={(e) => {
-                    e.currentTarget.src = FALLBACK_POSTER;
+                    e.currentTarget.style.opacity = '0';
                   }}
                   className="w-full h-full object-cover opacity-65"
                 />
@@ -145,7 +145,7 @@ export function ChannelsView({
                     alt={ch.name}
                     referrerPolicy="no-referrer"
                     onError={(e) => {
-                      e.currentTarget.src = FALLBACK_POSTER;
+                      e.currentTarget.style.opacity = '0';
                     }}
                     className="w-16 h-11 rounded-lg object-cover bg-slate-950 shrink-0"
                   />

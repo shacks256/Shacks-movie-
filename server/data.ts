@@ -6,13 +6,13 @@ import type {
   MediaItem,
   SeriesRecord,
   WorkerCodePayload,
-} from '../src/types.js';
+} from '../src/types.ts';
 
-const IMG_HERO = '/src/assets/images/cinema_hero_premiere_1795637611164.jpg';
-const IMG_ACTION = '/src/assets/images/action_thriller_scene_1795637611644.jpg';
-const IMG_SILO = '/src/assets/images/scifi_underground_silo_1795637610845.jpg';
-const IMG_KAMPALA = '/src/assets/images/kampala_drama_cinema_1795637611713.jpg';
-const IMG_STUDIO = '/src/assets/images/broadcast_studio_feed_1795637611326.jpg';
+const IMG_HERO = 'https://apposters.b-cdn.net/laba/yo/naki/8bQz2758.jpg';
+const IMG_ACTION = 'https://apposters.b-cdn.net/laba/yo/naki/l0XV9984.jpg';
+const IMG_SILO = 'https://apposters.b-cdn.net/laba/yo/naki/EiU52ws1PI3828.jpg';
+const IMG_KAMPALA = 'https://apposters.b-cdn.net/laba/yo/naki/g9nG1626.jpg';
+const IMG_STUDIO = 'https://apposters.b-cdn.net/laba/yo/naki/9Nyf6137.jpg';
 
 const SAMPLE_VIDEOS = {
   tearsOfSteel: 'https://media.w3.org/2010/05/sintel/trailer.mp4',
@@ -723,9 +723,9 @@ export const ENDPOINT_PRESETS: EndpointPreset[] = [
       },
       {
         step: 3,
-        title: 'Self-Hosted URL Normalization',
+        title: 'Stream URL Normalization',
         status: 'route',
-        detail: 'Bound poster (/img/m/57865.jpg) and byte-range stream (/stream/57865) to site origin.',
+        detail: 'Preserved original image URL and bound byte-range stream (/stream/57865) to site origin.',
       },
       {
         step: 4,
@@ -745,7 +745,7 @@ export const ENDPOINT_PRESETS: EndpointPreset[] = [
         preview: {
           id: 57865,
           title: 'Neon Hunter: Cyber Protocol',
-          image: '/img/m/57865.jpg',
+          image: IMG_HERO,
           playingUrl: '/stream/57865',
           nxt_playing_url: '/stream/57865',
           streamUrl: '/stream/57865',
@@ -753,7 +753,7 @@ export const ENDPOINT_PRESETS: EndpointPreset[] = [
           duration: '01h 39m',
         },
       },
-      notes: 'Returns normalized preview and stream links hosted directly under UG SHACKS Movie API.',
+      notes: 'Returns original poster image URL alongside site-hosted stream playback links.',
     },
   },
   {
@@ -852,7 +852,7 @@ export const ENDPOINT_PRESETS: EndpointPreset[] = [
         vj: 'VJ Junior',
         size: '1.84 GB',
         duration: '01h 24m',
-        image: '/img/m/67861.jpg',
+        image: IMG_KAMPALA,
         playingurl: '/stream/67861',
         streamurl: '/stream/67861',
       },
@@ -1104,15 +1104,29 @@ export const AUDIT_REPORT: AuditReport = {
       id: 'ctrl-4',
       severity: 'MEDIUM',
       category: 'CORS & Headers',
-      title: 'Scoped CORS & Referrer-Policy Controls',
+      title: 'Scoped CORS & Hardened Security Headers',
       cwe: 'CWE-942: Permissive Cross-Domain Policy',
-      status: 'RECOMMENDED',
+      status: 'ENFORCED',
       description:
-        'Configures explicit CORS methods and exposes byte-range headers (Content-Range, Accept-Ranges) with Referrer-Policy: no-referrer.',
+        'Configures explicit CORS methods, HSTS, CSP, nosniff, and Referrer-Policy: no-referrer across gateway endpoints.',
       impact:
-        'Allows HTML5 video seeking across origins while suppressing referrer leakage.',
+        'Allows HTML5 video seeking across origins while blocking MIME sniffing, script injection, and referrer leakage.',
       remediation:
         'Set ALLOWED_ORIGIN to trusted production domains when deploying authenticated endpoints.',
+    },
+    {
+      id: 'ctrl-5',
+      severity: 'HIGH',
+      category: 'Anti-Scraping & WAF',
+      title: 'Bot Tarpit, Honeypot Jail & Burst Rate Limiter',
+      cwe: 'CWE-799: Improper Control of Interaction Frequency',
+      status: 'ENFORCED',
+      description:
+        'Detects automated scrapers, site cloners, exploit probes, and burst traffic, routing violators to an isolated HTTP 403 decoy HTML trap and auto-jailing offending IPs.',
+      impact:
+        'Blocks automated site scraping, vulnerability scanners, and denial-of-service bursts while keeping normal browsers and integrations uninterrupted.',
+      remediation:
+        'Keep strict parameter regex checks, honeypot routes, and bounded per-IP sliding rate windows active on all public routes.',
     },
   ],
 };

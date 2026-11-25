@@ -22,5 +22,3 @@ export function normalizeMediaUrl(url?: string): string {
     return trimmed.replace(/ /g, '%20');
   }
 }
-
-export const FALLBACK_POSTER = '/src/assets/images/cinema_hero_premiere_1795637611164.jpg';

@@ -68,11 +68,49 @@ export default function App() {
       const res = await fetch('/dashboard', { headers: { Accept: 'application/json' } });
       if (!res.ok) throw new Error(`Dashboard API error: ${res.status}`);
       const payload = await res.json();
-      const normalized = (payload.movies || []).map((m: MediaItem) => ({
+      const normalized: MediaItem[] = (payload.movies || []).map((m: MediaItem) => ({
         ...m,
         playingurl: normalizeMediaUrl(m.playingurl),
       }));
       setMovies(normalized);
+
+      const actionPlaceholders = normalized
+        .filter((m) => /action/i.test(m.category_name || '') && /^Media #\d+$/i.test(m.title))
+        .slice(0, 8);
+
+      if (actionPlaceholders.length > 0) {
+        Promise.allSettled(
+          actionPlaceholders.map(async (stub) => {
+            const detailRes = await fetch(`/movie/${stub.id}`, {
+              headers: { Accept: 'application/json' },
+            });
+            if (!detailRes.ok) return null;
+            const detail: MediaItem = await detailRes.json();
+            return { stubId: stub.id, detail };
+          })
+        ).then((results) => {
+          const enrichedById = new Map<number, MediaItem>();
+          results.forEach((r) => {
+            if (r.status === 'fulfilled' && r.value?.detail) {
+              enrichedById.set(r.value.stubId, r.value.detail);
+            }
+          });
+          if (enrichedById.size === 0) return;
+          setMovies((prev) =>
+            prev.map((item) => {
+              const detail = enrichedById.get(item.id);
+              if (!detail) return item;
+              return {
+                ...item,
+                ...detail,
+                category_name: item.category_name || detail.category_name,
+                playingurl: normalizeMediaUrl(detail.playingurl || item.playingurl),
+                streamurl: detail.streamurl || item.streamurl,
+              };
+            })
+          );
+        });
+      }
     } catch (err) {
       setDashboardError(err instanceof Error ? err.message : 'Failed to load catalog');
     } finally {
@@ -140,6 +178,35 @@ export default function App() {
     fetchWorkerCode();
     fetchAudit();
   }, [fetchDashboard, fetchChannels, fetchPresets, fetchWorkerCode, fetchAudit]);
+
+  useEffect(() => {
+    const handleContextMenu = (e: MouseEvent) => {
+      const target = e.target as HTMLElement | null;
+      if (!target) return;
+      if (target.closest('img, video, article')) {
+        e.preventDefault();
+      }
+    };
+
+    const handleKeyDown = (e: KeyboardEvent) => {
+      const key = e.key.toLowerCase();
+      const ctrlOrMeta = e.ctrlKey || e.metaKey;
+      const isDevToolsShortcut =
+        e.key === 'F12' ||
+        (ctrlOrMeta && e.shiftKey && (key === 'i' || key === 'j' || key === 'c')) ||
+        (ctrlOrMeta && (key === 'u' || key === 's'));
+      if (isDevToolsShortcut) {
+        e.preventDefault();
+      }
+    };
+
+    window.addEventListener('contextmenu', handleContextMenu);
+    window.addEventListener('keydown', handleKeyDown);
+    return () => {
+      window.removeEventListener('contextmenu', handleContextMenu);
+      window.removeEventListener('keydown', handleKeyDown);
+    };
+  }, []);
 
   const executeSearch = useCallback(async (rawQuery: string) => {
     const trimmed = rawQuery.trim();
