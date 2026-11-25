@@ -1,0 +1,8 @@
+{
+  "name": "UG SHACKS Movie API",
+  "description": "High-speed movie streaming portal, edge proxy router, and media API hub powered by UG SHACKS Movie API.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
