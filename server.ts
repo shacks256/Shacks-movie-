@@ -1,10 +1,11 @@
 import 'dotenv/config';
 import crypto from 'crypto';
 import express, { type Request, type Response } from 'express';
+import { getContext } from '@netlify/server';
 import fs from 'fs';
 import path from 'path';
 import { Readable } from 'stream';
-import { fileURLToPath } from 'url';
+import { fileURLToPath, pathToFileURL } from 'url';
 import {
   AUDIT_REPORT,
   CATALOG_MOVIES,
@@ -14,14 +15,14 @@ import {
   SERIES_CATALOG,
   WORKER_CODE_DATA,
   findAllMediaItems,
-} from './server/data.js';
-import type { LiveChannel, MediaItem, SeriesRecord, SeriesSeason } from './src/types.js';
+} from './server/data.ts';
+import type { LiveChannel, MediaItem, SeriesRecord, SeriesSeason } from './src/types.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const PORT = Number(process.env.PORT) || 3000;
-const UPSTREAM_SOURCE = process.env.UPSTREAM_API_URL?.trim() || 'https://mumowatch.ai.studio';
+const UPSTREAM_SOURCE = process.env.UPSTREAM_API_URL?.trim() || '';
 const UPSTREAM_KEY = process.env.UPSTREAM_API_KEY?.trim() || '';
 function resolveLocalAsset(relPath: string): string | undefined {
   const cleanRel = relPath.replace(/^\/+/, '');
@@ -70,6 +71,20 @@ function hashKey(value: string): string {
 }
 
 function getPublicOrigin(req: Request): string {
+  try {
+    // On Netlify, the request context carries the real public URL
+    const ctx = getContext();
+    const isLoopback = (host: string) => /^(127\.|localhost|\[::1\])/.test(host);
+    const fwdHost = (req.headers['x-forwarded-host'] as string | undefined)?.split(',')[0]?.trim();
+    if (fwdHost && !isLoopback(fwdHost)) {
+      const fwdProto = (req.headers['x-forwarded-proto'] as string | undefined)?.split(',')[0]?.trim();
+      return `${fwdProto || ctx.url.protocol.replace(':', '')}://${fwdHost}`;
+    }
+    if (ctx?.url && !isLoopback(ctx.url.host)) return ctx.url.origin;
+    if (ctx?.site?.url) return ctx.site.url.replace(/\/$/, '');
+  } catch {
+    // Not running inside Netlify Server
+  }
   const fwdProto = (req.headers['x-forwarded-proto'] as string | undefined)
     ?.split(',')[0]
     ?.trim();
@@ -519,7 +534,7 @@ async function ensureRegistriesWarmed(): Promise<void> {
   await warmPromise;
 }
 
-async function createApp() {
+export async function createApp({ serveFrontend = true }: { serveFrontend?: boolean } = {}) {
   const app = express();
   app.set('trust proxy', true);
   app.disable('x-powered-by');
@@ -770,6 +785,9 @@ async function createApp() {
         res.sendFile(localPath);
         return;
       }
+      // Bundled server can't see local assets; the CDN serves them as static files
+      res.redirect(302, targetImageUrl);
+      return;
     }
 
     if (targetImageUrl && /^https?:\/\//i.test(targetImageUrl)) {
@@ -1010,7 +1028,9 @@ async function createApp() {
     res.json(toPublicMediaItem(raw, baseUrl));
   });
 
-  if (process.env.NODE_ENV !== 'production') {
+  if (!serveFrontend) {
+    // Frontend is served as static files (e.g. by the Netlify CDN)
+  } else if (process.env.NODE_ENV !== 'production') {
     const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: { middlewareMode: true },
@@ -1030,13 +1050,20 @@ async function createApp() {
     });
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`UG SHACKS Movie API server listening on http://0.0.0.0:${PORT}`);
-    warmRegistries();
-  });
+  return app;
 }
 
-createApp().catch((err) => {
-  console.error('Failed to start server:', err);
-  process.exit(1);
-});
+const isDirectRun = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
+if (isDirectRun) {
+  createApp()
+    .then((app) => {
+      app.listen(PORT, '0.0.0.0', () => {
+        console.log(`UG SHACKS Movie API server listening on http://0.0.0.0:${PORT}`);
+        warmRegistries();
+      });
+    })
+    .catch((err) => {
+      console.error('Failed to start server:', err);
+      process.exit(1);
+    });
+}
