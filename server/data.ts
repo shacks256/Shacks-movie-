@@ -6,7 +6,7 @@ import type {
   MediaItem,
   SeriesRecord,
   WorkerCodePayload,
-} from '../src/types.js';
+} from '../src/types.ts';
 
 const IMG_HERO = '/src/assets/images/cinema_hero_premiere_1795637611164.jpg';
 const IMG_ACTION = '/src/assets/images/action_thriller_scene_1795637611644.jpg';
