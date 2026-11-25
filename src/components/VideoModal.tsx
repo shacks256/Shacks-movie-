@@ -10,6 +10,7 @@ interface VideoModalProps {
 
 export function VideoModal({ item, onClose }: VideoModalProps) {
   const [streamMode, setStreamMode] = useState<'stream' | 'play'>('stream');
+  const [videoFailed, setVideoFailed] = useState(false);
   const videoRef = useRef<HTMLVideoElement | null>(null);
 
   const isLiveChannel = item.category_id === 'live';
@@ -44,7 +45,10 @@ export function VideoModal({ item, onClose }: VideoModalProps) {
           <div className="flex items-center gap-2 shrink-0">
             <button
               type="button"
-              onClick={() => setStreamMode((prev) => (prev === 'stream' ? 'play' : 'stream'))}
+              onClick={() => {
+                setVideoFailed(false);
+                setStreamMode((prev) => (prev === 'stream' ? 'play' : 'stream'));
+              }}
               className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs font-mono text-emerald-400 border border-slate-700 transition-colors whitespace-nowrap shrink-0"
               title="Switch between /stream/:id and /movie/:id/play endpoints"
             >
@@ -62,7 +66,7 @@ export function VideoModal({ item, onClose }: VideoModalProps) {
         </div>
 
         <div className="relative aspect-video bg-black flex items-center justify-center">
-          {activeSrc ? (
+          {activeSrc && !videoFailed ? (
             <video
               key={activeSrc}
               ref={videoRef}
@@ -71,9 +75,12 @@ export function VideoModal({ item, onClose }: VideoModalProps) {
               controls
               autoPlay
               playsInline
+              preload="metadata"
               onError={() => {
                 if (streamMode === 'stream' && mediaKey) {
                   setStreamMode('play');
+                } else {
+                  setVideoFailed(true);
                 }
               }}
               className="w-full h-full object-contain"
@@ -82,17 +89,29 @@ export function VideoModal({ item, onClose }: VideoModalProps) {
             <div className="text-center p-8 space-y-3">
               <TriangleAlert className="w-10 h-10 text-amber-500 mx-auto" />
               <p className="text-sm text-slate-300">
-                Stream ready via UG SHACKS endpoint
+                Stream ready via UG SHACKS player endpoint
               </p>
-              <a
-                href={`/movie/${mediaKey}/play`}
-                target="_blank"
-                rel="noreferrer"
-                className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-rose-600 hover:bg-rose-500 text-white text-xs font-semibold whitespace-nowrap"
-              >
-                <Play className="w-4 h-4 fill-white" />
-                <span>Open Stream</span>
-              </a>
+              <div className="flex flex-wrap items-center justify-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setVideoFailed(false);
+                    setStreamMode('stream');
+                  }}
+                  className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-white text-xs font-semibold whitespace-nowrap"
+                >
+                  <span>Retry Inline Player</span>
+                </button>
+                <a
+                  href={`/movie/${mediaKey}/play`}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-rose-600 hover:bg-rose-500 text-white text-xs font-semibold whitespace-nowrap"
+                >
+                  <Play className="w-4 h-4 fill-white" />
+                  <span>Open Direct Watch</span>
+                </a>
+              </div>
             </div>
           )}
         </div>

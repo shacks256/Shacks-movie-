@@ -107,7 +107,8 @@ function registerVideo(id: string, rawUrl?: string, title = 'media'): void {
   if (!rawUrl || typeof rawUrl !== 'string') return;
   const trimmed = rawUrl.trim();
   if (!trimmed) return;
-  setBoundedMap(videoRegistry, id, { url: trimmed, title });
+  const cleanTitle = sanitizeText(title, `media_${id}`) || `media_${id}`;
+  setBoundedMap(videoRegistry, id, { url: trimmed, title: cleanTitle });
 }
 
 function toPublicMediaItem(raw: Partial<MediaItem>, baseUrl: string): MediaItem {
@@ -333,19 +334,19 @@ async function resolveVideoTarget(
     const foundUp = upstreamChannels?.find((c) => c.id === id);
     if (foundUp?.playingurl) {
       registerVideo(id, foundUp.playingurl, foundUp.name);
-      return { url: foundUp.playingurl, title: foundUp.name };
+      return videoRegistry.get(id);
     }
     const foundLocal = LIVE_CHANNELS.find((c) => c.id === id);
     if (foundLocal?.playingurl) {
       registerVideo(id, foundLocal.playingurl, foundLocal.name);
-      return { url: foundLocal.playingurl, title: foundLocal.name };
+      return videoRegistry.get(id);
     }
   }
 
   const media = await fetchRawMediaById(id);
   if (media?.playingurl) {
     registerVideo(id, media.playingurl, media.title || `video_${id}`);
-    return { url: media.playingurl, title: media.title || `video_${id}` };
+    return videoRegistry.get(id);
   }
 
   return undefined;
@@ -812,11 +813,225 @@ async function createApp() {
     res.status(404).end();
   });
 
+  const MAX_STREAM_CHUNK = 4 * 1024 * 1024; // 4 MB keeps every Cloud Run HTTP response well under 32 MB
+
+  function escapeHtml(value: string): string {
+    return value
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
+  }
+
+  function buildBoundedRangeHeader(rangeHeader?: string): string {
+    if (!rangeHeader) {
+      return `bytes=0-${MAX_STREAM_CHUNK - 1}`;
+    }
+    const std = /^bytes=(\d+)-(\d*)$/i.exec(rangeHeader.trim());
+    if (std) {
+      const start = Number(std[1]);
+      const reqEnd = std[2] ? Number(std[2]) : undefined;
+      const cappedEnd =
+        reqEnd !== undefined && Number.isFinite(reqEnd) && reqEnd >= start
+          ? Math.min(reqEnd, start + MAX_STREAM_CHUNK - 1)
+          : start + MAX_STREAM_CHUNK - 1;
+      return `bytes=${start}-${cappedEnd}`;
+    }
+    const suffix = /^bytes=-(\d+)$/i.exec(rangeHeader.trim());
+    if (suffix) {
+      const len = Math.min(Number(suffix[1]), MAX_STREAM_CHUNK);
+      return `bytes=-${len}`;
+    }
+    return `bytes=0-${MAX_STREAM_CHUNK - 1}`;
+  }
+
+  async function fetchUpstreamMedia(
+    url: string,
+    method: 'GET' | 'HEAD',
+    headers: Record<string, string>
+  ): Promise<globalThis.Response> {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 15000);
+    try {
+      const res = await fetch(safeExternalUrl(url), {
+        method,
+        headers,
+        redirect: 'follow',
+        signal: controller.signal,
+      });
+      clearTimeout(timer);
+      return res;
+    } catch (err) {
+      clearTimeout(timer);
+      throw err;
+    }
+  }
+
+  function renderHtmlPlayerPage(id: string, title: string, baseUrl: string): string {
+    const isChannel = id.startsWith('ch-');
+    const safeTitle = escapeHtml(title || `UG SHACKS #${id}`);
+    const posterUrl = `${baseUrl}/img/${isChannel ? 'c' : 'm'}/${encodeURIComponent(id)}.jpg`;
+    const streamUrl = `${baseUrl}/stream/${encodeURIComponent(id)}`;
+    const dlUrl = `${baseUrl}/api/dl/${encodeURIComponent(id)}`;
+    const jsonUrl = isChannel ? `${baseUrl}/api/channels` : `${baseUrl}/movie/${encodeURIComponent(id)}`;
+    return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="referrer" content="no-referrer" />
+  <title>${safeTitle} — UG SHACKS Movie API</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { margin: 0; background: #020617; color: #f8fafc; font-family: system-ui, -apple-system, sans-serif; min-height: 100vh; display: flex; flex-direction: column; }
+    header { padding: 14px 20px; border-bottom: 1px solid #1e293b; display: flex; align-items: center; justify-content: space-between; gap: 12px; background: #020617; }
+    .brand { font-weight: 800; font-size: 15px; color: #fff; text-decoration: none; }
+    .title { font-size: 13px; color: #cbd5e1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 50vw; }
+    .actions { display: flex; gap: 8px; flex-wrap: wrap; }
+    .btn { padding: 8px 12px; border-radius: 8px; background: #1e293b; color: #f1f5f9; text-decoration: none; font-size: 12px; font-weight: 600; border: 1px solid #334155; }
+    .btn:hover { background: #334155; }
+    main { flex: 1; display: flex; align-items: center; justify-content: center; padding: 16px; background: #000; }
+    video { width: 100%; max-width: 1120px; max-height: 82vh; background: #000; border-radius: 12px; border: 1px solid #1e293b; outline: none; }
+  </style>
+</head>
+<body>
+  <header>
+    <a class="brand" href="${escapeHtml(baseUrl)}/">UG SHACKS Movie API</a>
+    <div class="title">${safeTitle}</div>
+    <div class="actions">
+      <a class="btn" href="${escapeHtml(dlUrl)}">Download MP4</a>
+      <a class="btn" href="${escapeHtml(jsonUrl)}" target="_blank" rel="noreferrer">API JSON</a>
+    </div>
+  </header>
+  <main>
+    <video controls autoplay playsinline preload="metadata" poster="${escapeHtml(posterUrl)}" src="${escapeHtml(streamUrl)}"></video>
+  </main>
+</body>
+</html>`;
+  }
+
+  function renderHtmlDownloaderPage(
+    id: string,
+    title: string,
+    totalBytes: number,
+    baseUrl: string
+  ): string {
+    const safeTitle = escapeHtml(title || `UG SHACKS #${id}`);
+    const safeFile =
+      (title || `ugshacks_${id}`).replace(/[^a-zA-Z0-9._-]+/g, '_') + '.mp4';
+    const streamUrl = `${baseUrl}/stream/${encodeURIComponent(id)}`;
+    const sizeMb = totalBytes > 0 ? `${(totalBytes / (1024 * 1024)).toFixed(1)} MB` : 'Large MP4';
+    return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="referrer" content="no-referrer" />
+  <title>Download ${safeTitle} — UG SHACKS Movie API</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { margin: 0; background: #020617; color: #f8fafc; font-family: system-ui, -apple-system, sans-serif; min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 20px; }
+    .card { width: 100%; max-width: 520px; background: #0f172a; border: 1px solid #1e293b; border-radius: 16px; padding: 24px; }
+    h1 { margin: 0 0 8px; font-size: 18px; }
+    p { margin: 0 0 16px; font-size: 13px; color: #94a3b8; line-height: 1.5; }
+    .bar-wrap { width: 100%; height: 10px; background: #020617; border-radius: 999px; overflow: hidden; border: 1px solid #1e293b; margin-bottom: 12px; }
+    .bar { height: 100%; width: 0%; background: #e11d48; transition: width .2s; }
+    .status { font-size: 12px; font-family: monospace; color: #34d399; margin-bottom: 18px; }
+    .row { display: flex; gap: 10px; flex-wrap: wrap; }
+    button, a.btn { padding: 10px 16px; border-radius: 10px; font-size: 13px; font-weight: 600; cursor: pointer; text-decoration: none; border: none; }
+    button.primary { background: #e11d48; color: #fff; }
+    button.primary:disabled { opacity: 0.5; cursor: not-allowed; }
+    a.btn { background: #1e293b; color: #e2e8f0; border: 1px solid #334155; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>${safeTitle}</h1>
+    <p>File: <strong>${escapeHtml(safeFile)}</strong> (${escapeHtml(sizeMb)})<br/>Streamed in parallel 4 MB chunks directly from UG SHACKS Movie API.</p>
+    <div class="bar-wrap"><div id="bar" class="bar"></div></div>
+    <div id="status" class="status">Ready to download</div>
+    <div class="row">
+      <button id="dlBtn" class="primary" onclick="startDownload()">Start MP4 Download</button>
+      <a class="btn" href="${escapeHtml(baseUrl)}/movie/${encodeURIComponent(id)}/play">Watch in Browser</a>
+    </div>
+  </div>
+  <script>
+    const STREAM_URL = ${JSON.stringify(streamUrl)};
+    const FILE_NAME = ${JSON.stringify(safeFile)};
+    const TOTAL = ${Number(totalBytes) || 0};
+    const CHUNK = ${MAX_STREAM_CHUNK};
+
+    async function startDownload() {
+      const btn = document.getElementById('dlBtn');
+      const status = document.getElementById('status');
+      const bar = document.getElementById('bar');
+      btn.disabled = true;
+      try {
+        let total = TOTAL;
+        if (!total) {
+          const head = await fetch(STREAM_URL, { method: 'HEAD' });
+          total = Number(head.headers.get('content-length') || 0);
+        }
+        if (!total) throw new Error('Could not determine file size');
+
+        if (window.showSaveFilePicker) {
+          const handle = await window.showSaveFilePicker({
+            suggestedName: FILE_NAME,
+            types: [{ description: 'MP4 Video', accept: { 'video/mp4': ['.mp4'] } }]
+          });
+          const writable = await handle.createWritable();
+          for (let offset = 0; offset < total; offset += CHUNK) {
+            const end = Math.min(offset + CHUNK - 1, total - 1);
+            const r = await fetch(STREAM_URL, { headers: { Range: 'bytes=' + offset + '-' + end } });
+            if (!r.ok && r.status !== 206) throw new Error('Chunk failed: ' + r.status);
+            await writable.write(await r.arrayBuffer());
+            const pct = Math.min(100, Math.round(((end + 1) / total) * 100));
+            bar.style.width = pct + '%';
+            status.textContent = pct + '% (' + ((end + 1) / 1048576).toFixed(1) + ' / ' + (total / 1048576).toFixed(1) + ' MB)';
+          }
+          await writable.close();
+          status.textContent = 'Download complete: ' + FILE_NAME;
+        } else {
+          if (total > 600 * 1024 * 1024) {
+            status.textContent = 'Large file (' + (total / 1048576).toFixed(0) + ' MB) — use Desktop Chrome for chunked save or Watch in Browser.';
+            btn.disabled = false;
+            return;
+          }
+          const parts = [];
+          for (let offset = 0; offset < total; offset += CHUNK) {
+            const end = Math.min(offset + CHUNK - 1, total - 1);
+            const r = await fetch(STREAM_URL, { headers: { Range: 'bytes=' + offset + '-' + end } });
+            if (!r.ok && r.status !== 206) throw new Error('Chunk failed: ' + r.status);
+            parts.push(await r.arrayBuffer());
+            const pct = Math.min(100, Math.round(((end + 1) / total) * 100));
+            bar.style.width = pct + '%';
+            status.textContent = pct + '%';
+          }
+          const blob = new Blob(parts, { type: 'video/mp4' });
+          const a = document.createElement('a');
+          a.href = URL.createObjectURL(blob);
+          a.download = FILE_NAME;
+          a.click();
+          status.textContent = 'Download complete: ' + FILE_NAME;
+        }
+      } catch (e) {
+        status.textContent = e && e.message ? e.message : 'Download interrupted';
+      } finally {
+        btn.disabled = false;
+      }
+    }
+  </script>
+</body>
+</html>`;
+  }
+
   const proxyVideoStream = async (
     req: Request,
     res: Response,
     asAttachment = false
   ) => {
+    const baseUrl = getPublicOrigin(req);
     const id = String(req.params.id || '');
     const resolved = await resolveVideoTarget(id);
 
@@ -825,36 +1040,75 @@ async function createApp() {
       return;
     }
 
+    const isBrowserDocNav =
+      req.method === 'GET' &&
+      !req.headers.range &&
+      Boolean(req.headers.accept?.includes('text/html')) &&
+      req.headers['sec-fetch-dest'] !== 'video';
+
+    if (isBrowserDocNav && !asAttachment) {
+      res.setHeader('Content-Type', 'text/html; charset=utf-8');
+      res.setHeader('Cache-Control', 'no-store');
+      res.send(renderHtmlPlayerPage(id, resolved.title, baseUrl));
+      return;
+    }
+
     try {
-      const fetchHeaders: Record<string, string> = {
+      const targetUrl = resolved.url;
+      const baseFetchHeaders: Record<string, string> = {
         'User-Agent': MEDIA_FETCH_UA,
       };
-      if (req.headers.range) {
-        fetchHeaders.Range = req.headers.range;
-      }
-      if (req.headers['if-range']) {
-        fetchHeaders['If-Range'] = String(req.headers['if-range']);
+
+      let skipRangeCap = false;
+      if (asAttachment && isBrowserDocNav) {
+        let totalBytes = 0;
+        try {
+          const headRes = await fetchUpstreamMedia(targetUrl, 'HEAD', baseFetchHeaders);
+          totalBytes = Number(headRes.headers.get('content-length') || 0);
+        } catch {
+          totalBytes = 0;
+        }
+        if (totalBytes === 0 || totalBytes > 24 * 1024 * 1024) {
+          res.setHeader('Content-Type', 'text/html; charset=utf-8');
+          res.setHeader('Cache-Control', 'no-store');
+          res.send(renderHtmlDownloaderPage(id, resolved.title, totalBytes, baseUrl));
+          return;
+        }
+        skipRangeCap = true;
       }
 
-      let upstream = await fetch(safeExternalUrl(resolved.url), {
-        method: req.method === 'HEAD' ? 'HEAD' : 'GET',
-        headers: fetchHeaders,
-        redirect: 'follow',
-      });
+      const fetchHeaders: Record<string, string> = { ...baseFetchHeaders };
+      if (req.method !== 'HEAD' && !skipRangeCap) {
+        fetchHeaders.Range = buildBoundedRangeHeader(req.headers.range);
+        if (req.headers['if-range']) {
+          fetchHeaders['If-Range'] = String(req.headers['if-range']);
+        }
+      }
+
+      let upstream = await fetchUpstreamMedia(
+        targetUrl,
+        req.method === 'HEAD' ? 'HEAD' : 'GET',
+        fetchHeaders
+      );
 
       if (!upstream.ok && upstream.status !== 206) {
         const localFallback = findLocalMediaById(id);
-        if (localFallback?.playingurl && localFallback.playingurl !== resolved.url) {
-          upstream = await fetch(safeExternalUrl(localFallback.playingurl), {
-            method: req.method === 'HEAD' ? 'HEAD' : 'GET',
-            headers: fetchHeaders,
-            redirect: 'follow',
-          });
+        if (localFallback?.playingurl && localFallback.playingurl !== targetUrl) {
+          upstream = await fetchUpstreamMedia(
+            localFallback.playingurl,
+            req.method === 'HEAD' ? 'HEAD' : 'GET',
+            fetchHeaders
+          );
         }
       }
 
       if (!upstream.ok && upstream.status !== 206) {
-        res.status(502).json({ error: 'Media stream temporarily unavailable' });
+        res.status(upstream.status === 416 ? 416 : 502).json({
+          error:
+            upstream.status === 416
+              ? 'Requested byte range out of bounds'
+              : 'Media stream temporarily unavailable',
+        });
         return;
       }
 
@@ -905,6 +1159,7 @@ async function createApp() {
   app.get('/movie/:id/play', (req, res) => proxyVideoStream(req, res, false));
   app.head('/movie/:id/play', (req, res) => proxyVideoStream(req, res, false));
   app.get('/api/dl/:id', (req, res) => proxyVideoStream(req, res, true));
+  app.head('/api/dl/:id', (req, res) => proxyVideoStream(req, res, true));
 
   app.get('/api/channels', async (req: Request, res: Response) => {
     const baseUrl = getPublicOrigin(req);
